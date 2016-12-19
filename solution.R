@@ -8,8 +8,14 @@ raw$shot_made_flag <- as.factor(raw$shot_made_flag)
 raw$action_type <- as.factor(raw$action_type)
 raw$season <- as.character(raw$season)
 
+
 # derive new feature
 raw$time_remaining <- raw$minutes_remaining * 60 + raw$seconds_remaining
+raw$lastsec <- 1*(raw$seconds_remaining == 1)
+raw$lastmin <- 1*(raw$minutes_remaining == 0)
+raw$away <- 1*grepl('@', raw$matchup)
+raw$dist <- sqrt(raw$loc_x^2 + raw$loc_y^2)
+raw$close <- 1*(raw$dist < 50)
 
 #split season 
 raw$meta_season <- substr(raw$season, 1, 4)
@@ -46,10 +52,14 @@ train <- raw[!is.na(raw$shot_made_flag),]
 test <- raw[is.na(raw$shot_made_flag),]
 
 num_mytrain <- floor(nrow(train) * 0.75)
+sam <- sample(1:dim(train)[1], num_mytrain)
 
-my_train <- train[1:num_mytrain,]
+my_train <- train[sam,]
+# dim(my_train)
+
 my_train.shot_made_flag <- my_train$numeric_shot_made_flag
-my_test <- train[-(1:num_mytrain),]
+my_test <- train[-(sam),]
+dim(my_test)
 
 train.shot_made_flag <- train$numeric_shot_made_flag
 
@@ -132,72 +142,105 @@ str(my_train.shot_made_flag)
 my_train$shot_made_flag <- NULL
 my_test$shot_made_flag <- NULL
 
-my_trainM<-data.matrix(my_train, rownames.force = NA)
-my_dtrain <- xgb.DMatrix(data=my_trainM, label=my_train.shot_made_flag, missing = NaN);
-my_watchlist <- list(my_trainM=my_dtrain)
+trainM <- model.matrix(~ combined_shot_type +
+                          shot_distance +
+                          dist +
+                          lastsec +
+                          close +
+                          lastmin +
+                          playoffs +
+                          away +
+                          shot_type + 
+                          opponent +
+                          action_type +
+                          shot_zone_basic, data = train)[,-1]
 
+testM <- model.matrix(~  combined_shot_type +
+                         shot_distance +
+                         dist +
+                         lastsec +
+                         close +
+                         lastmin +
+                         playoffs +
+                         away +
+                         shot_type + 
+                         opponent +
+                         action_type +
+                         shot_zone_basic, data = test)[,-1]
+
+Y <- as.numeric(train.shot_made_flag)
+
+nrounds = 400
+cv.error <- xgb.cv(data = trainM, label = Y, 
+                   objective = "binary:logistic",
+                   eval_metric = "logloss",
+                   eta = 0.03, 
+                   max_depth = 8,
+                   nrounds = nrounds,
+                   gamma = 1,
+                   subsample = 0.8,
+                   colsample_bytree = 0.5,
+                   min_child_weight = 10,
+                   nfold = 10)
+
+min(cv.error$test.logloss.mean)
+bestRounds <- which.min(cv.error$test.logloss.mean)
+
+#100 rounds, 6 depth, eta = 0.03, gamma = 0.1, logloss = 0.60739
+#100 rounds, 6 depth, eta = 0.03, gamma = 2, logloss = 0.607554
+#100 rounds, 6 depth, eta = 0.03, gamma = 1, logloss = 0.607376
+
+#400 rounds, 6 depth, eta = 0.03, gamma = 1, logloss = 0.60357
+#400 rounds, 6 depth, eta = 0.03, gamma = 0.1, logloss = 0.60411
+
+xgb_model <- xgboost(data = trainM, label = Y, 
+                     objective = "binary:logistic",
+                     eval_metric = "logloss",
+                     eta = 0.03, 
+                     max_depth = 6,
+                     nrounds = bestRounds,
+                     gamma = 0.5,
+                     subsample = 0.8,
+                     colsample_bytree = 0.5)
+
+preds <- predict(xgb_model, testM)
+# 326th ranking
+
+# final_result <- preds
+# final_result[final_result>1] <- 1
+# 
+# cat("Saving the submission file\n")
+# submission <- data.frame(shot_id=test.shot_id, shot_made_flag=final_result)
+# write.csv(submission, "solution.csv", row.names = F)
+
+# Monte Carlo simulation - averaging all the xgb model result
 set.seed(2016)
-param <- list(  objective           = "binary:logistic", 
-                booster             = "gbtree",
-                eval_metric         = "logloss",
-                eta                 = 0.035,
-                max_depth           = 4,
-                subsample           = 0.40,
-                colsample_bytree    = 0.40
-)
+ensemble_preds <- replicate(200, {
+  model_xgb <- xgboost(data = trainM, label = Y, 
+                       objective = "binary:logistic",
+                       eval_metric = "logloss",
+                       eta = 0.03, 
+                       max_depth = sample(7:8,1),
+                       nrounds = 400,
+                       gamma = 0.1,
+                       subsample = sample(c(0.8,1), 1),
+                       colsample_bytree = sample(c(0.5,0.8), 1))
+  predict(model_xgb, testM)})
 
-my_clf <- xgb.cv(params             = param, 
-                data                = my_dtrain, 
-                nrounds             = 1500, 
-                verbose             = 1,
-                watchlist           = my_watchlist,
-                maximize            = FALSE,
-                nfold               = 3,
-                early.stop.round    = 10,
-                print.every.n       = 1
-);
+mean_ensemble_result <- rowMeans(ensemble_preds)
 
-my_bestRound <- which.min(as.matrix(my_clf)[,3] + as.matrix(my_clf)[,4]);
-cat("Best round:", my_bestRound,"\n");
-cat("Best result:",as.matrix(my_clf)[my_bestRound,],"\n")
-
-test.shot_id <- test$shot_id
-train$shot_id <- NULL
-test$shot_id <- NULL
-train$shot_made_flag <- NULL
-test$shot_made_flag <- NULL
-test$numeric_shot_made_flag <- NULL
-
-trainM<-data.matrix(train, rownames.force = NA)
-dtrain <- xgb.DMatrix(data=trainM, label=train.shot_made_flag, missing = NaN);
-watchlist <- list(trainM=dtrain)
-  
-set.seed(2016)
-bst <- xgboost(     params              = param, 
-                    data                = dtrain, 
-                    nrounds             = my_bestRound, 
-                    verbose             = 1,
-                    watchlist           = watchlist,
-                    maximize            = FALSE
-)
-
-testM <- data.matrix(test, rownames.force = NA);
-preds <- predict(bst, testM, ntreelimit = my_bestRound);
-
-head(preds)
-head(as.vector(logit_result))
-final_result <- (0.9*preds + 0.1*as.vector(logit_result))
-final_result[final_result>1] <- 1
-# 1004th ranking =.=!
-
-# intend to iterate through my_train on both xgboost and logistic to find out the right weightage with my_test.
-# might even stacking with another logistic regression. 
-# would continue later
+# solutions <- data.frame(shot_id = test.shot_id, shot_made_flag = mean_ensemble_result)
+# write.csv(solutions, "solution.csv", row.names = FALSE)
+# 368th ranking
 
 # final_result
 # head(final_result)
-
 cat("Saving the submission file\n")
-submission <- data.frame(shot_id=test.shot_id, shot_made_flag=final_result)
-write.csv(submission, "solution.csv", row.names = F)
 
+#ensemble all result by giving averaage weight
+
+final_result <- (mean_ensemble_result + preds) / 2
+final_result[final_result>1] <- 1
+submission <- data.frame(shot_id=test.shot_id, shot_made_flag=final_result)
+write.csv(submission, "final_solution.csv", row.names = F)
+# 326th ranking
